@@ -143,6 +143,8 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// Task's spans join the trace of whoever ran it (TRACEPARENT).
+	ctx = telemetry.ParentFromEnv(ctx)
 	defer func() {
 		if err := otel_shutdown(ctx); err != nil {
 			log.Errf(logger.Red, "failed to shutdown OpenTelemetry: %v\n", err)

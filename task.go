@@ -24,6 +24,7 @@ import (
 	"github.com/go-task/task/v3/internal/slicesext"
 	"github.com/go-task/task/v3/internal/sort"
 	"github.com/go-task/task/v3/internal/summary"
+	"github.com/go-task/task/v3/internal/telemetry"
 	"github.com/go-task/task/v3/internal/templater"
 	"github.com/go-task/task/v3/taskfile/ast"
 )
@@ -310,6 +311,10 @@ func (e *Executor) RunTask(ctx context.Context, call *Call) (err error) {
 		span.SetAttributes(attribute.String("task.outcome", "executed"))
 		return nil
 	}); err != nil {
+		span.SetAttributes(attribute.String("task.outcome", "failed"))
+		if exitCode, ok := errors.AsType[interp.ExitStatus](err); ok {
+			span.SetAttributes(attribute.Int("process.exit.code", int(exitCode)))
+		}
 		err = &errors.TaskRunError{TaskName: t.Name(), Err: err}
 		return err
 	}
@@ -497,7 +502,7 @@ func (e *Executor) runCommand(ctx context.Context, t *ast.Task, call *Call, i in
 		err = execext.RunCommand(ctx, &execext.RunCommandOptions{
 			Command:   cmd.Cmd,
 			Dir:       t.Dir,
-			Env:       env.Get(t),
+			Env:       telemetry.Environ(ctx, env.Get(t)),
 			PosixOpts: slicesext.UniqueJoin(e.Taskfile.Set, t.Set, cmd.Set),
 			BashOpts:  slicesext.UniqueJoin(e.Taskfile.Shopt, t.Shopt, cmd.Shopt),
 			Stdin:     e.Stdin,
