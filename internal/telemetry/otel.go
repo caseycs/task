@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"go.opentelemetry.io/contrib/exporters/autoexport"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/sdk/trace"
@@ -31,24 +31,26 @@ var (
 // DefaultServiceName is the spans' service when OTEL_SERVICE_NAME is unset.
 const DefaultServiceName = "task"
 
-// Enabled reports whether spans are exported: OTEL_TRACES_EXPORTER names an
-// exporter (other than "none"), or an OTLP endpoint is set
-// (OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT), which
-// the OTLP exporter then sends to.
+// Enabled reports whether spans are exported: OTEL_TRACES_EXPORTER is
+// "otlp", or it is unset and an OTLP endpoint is
+// (OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT). Spans
+// go over OTLP/HTTP (protobuf) only: no other exporter, to keep Task's
+// dependencies small.
 func Enabled() bool {
-	switch exporter := os.Getenv("OTEL_TRACES_EXPORTER"); {
-	case exporter == "none":
-		return false
-	case exporter != "":
+	switch os.Getenv("OTEL_TRACES_EXPORTER") {
+	case "otlp":
 		return true
+	case "":
+		return os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") != "" || os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") != ""
 	}
-	return os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") != "" || os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") != ""
+	return false
 }
 
 // Initialize sets up tracing when Enabled: the global TracerProvider
-// exporting spans per the OTEL_* environment, and the W3C trace context
-// propagator. OpenTelemetry's own errors (e.g. a failed export) go to
-// onError, nil to drop them. The returned func flushes and shuts down,
+// exporting spans over OTLP/HTTP per the OTEL_EXPORTER_OTLP_* environment
+// (endpoint, headers, compression, certificate, timeout), and the W3C trace
+// context propagator. OpenTelemetry's own errors (e.g. a failed export) go
+// to onError, nil to drop them. The returned func flushes and shuts down,
 // taking at most FlushTimeout.
 func Initialize(ctx context.Context, onError func(error)) (TracerProviderShutdownFunc, error) {
 	if !Enabled() {
@@ -60,7 +62,7 @@ func Initialize(ctx context.Context, onError func(error)) (TracerProviderShutdow
 		}
 	}))
 
-	spanExporter, err := autoexport.NewSpanExporter(ctx)
+	spanExporter, err := otlptracehttp.New(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("creating span exporter: %w", err)
 	}
