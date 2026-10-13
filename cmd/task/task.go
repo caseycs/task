@@ -139,7 +139,15 @@ func run() error {
 		task.WithVersionCheck(true),
 	)
 	ctx := context.Background()
-	otel_shutdown, err := telemetry.Initialize(ctx)
+	// Sending spans never gets in the way: its errors (a collector that is
+	// down) show only with --verbose, and it delays the exit at most
+	// telemetry.FlushTimeout.
+	otelError := func(err error) {
+		if flags.Verbose {
+			log.Errf(logger.Yellow, "task: OpenTelemetry: %v\n", err)
+		}
+	}
+	otel_shutdown, err := telemetry.Initialize(ctx, otelError)
 	if err != nil {
 		return err
 	}
@@ -147,7 +155,7 @@ func run() error {
 	ctx = telemetry.ParentFromEnv(ctx)
 	defer func() {
 		if err := otel_shutdown(ctx); err != nil {
-			log.Errf(logger.Red, "failed to shutdown OpenTelemetry: %v\n", err)
+			otelError(err)
 		}
 	}()
 
