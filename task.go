@@ -106,7 +106,7 @@ func (e *Executor) Run(ctx context.Context, calls ...*Call) error {
 	}
 
 	if len(watchCalls) > 0 {
-		return e.watchTasks(watchCalls...)
+		return e.watchTasks(ctx, watchCalls...)
 	}
 
 	return nil
@@ -158,6 +158,9 @@ func (e *Executor) RunTask(ctx context.Context, call *Call) (err error) {
 	))
 	defer func() {
 		if err != nil {
+			// Any failure, its own or a dep's, before or while it ran (a
+			// missing required var, a failed if:, a timeout, …).
+			span.SetAttributes(attribute.String("task.outcome", "failed"))
 			span.RecordError(err)
 			span.SetStatus(codes.Error, err.Error())
 		}
@@ -282,7 +285,7 @@ func (e *Executor) RunTask(ctx context.Context, call *Call) (err error) {
 
 		for i := range t.Cmds {
 			if t.Cmds[i].Defer {
-				defer e.runDeferred(t, call, i, t.Vars, &deferredExitCode)
+				defer e.runDeferred(ctx, t, call, i, t.Vars, &deferredExitCode)
 				continue
 			}
 
@@ -303,18 +306,23 @@ func (e *Executor) RunTask(ctx context.Context, call *Call) (err error) {
 				} else if _, ok := errors.AsType[*errors.TaskTimeoutError](err); ok {
 					deferredExitCode = errors.TimeoutExitCode
 				}
+				// The exit code of the task's own command that failed (124
+				// on a timeout); a failed dep's stays on the dep's span.
+				if deferredExitCode > 0 {
+					span.SetAttributes(attribute.Int("process.exit.code", int(deferredExitCode)))
+				}
 
 				return err
 			}
 		}
 		e.Logger.VerboseErrf(logger.Magenta, "task: %q finished\n", call.Task)
-		span.SetAttributes(attribute.String("task.outcome", "executed"))
+		if e.Dry {
+			span.SetAttributes(attribute.String("task.outcome", "skipped"), attribute.String("task.skip_reason", "dry_run"))
+		} else {
+			span.SetAttributes(attribute.String("task.outcome", "executed"))
+		}
 		return nil
 	}); err != nil {
-		span.SetAttributes(attribute.String("task.outcome", "failed"))
-		if exitCode, ok := errors.AsType[interp.ExitStatus](err); ok {
-			span.SetAttributes(attribute.Int("process.exit.code", int(exitCode)))
-		}
 		err = &errors.TaskRunError{TaskName: t.Name(), Err: err}
 		return err
 	}
@@ -370,8 +378,11 @@ func (e *Executor) runDeps(ctx context.Context, t *ast.Task) error {
 	return g.Wait()
 }
 
-func (e *Executor) runDeferred(t *ast.Task, call *Call, i int, vars *ast.Vars, deferredExitCode *uint8) {
-	ctx, cancel := context.WithCancel(context.Background())
+// runDeferred runs the deferred command i of t. It runs under ctx's span (the
+// task's: its command span is a child of it) but not its cancellation: a
+// deferred command runs even when the task was cancelled.
+func (e *Executor) runDeferred(ctx context.Context, t *ast.Task, call *Call, i int, vars *ast.Vars, deferredExitCode *uint8) {
+	ctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancel()
 
 	cmd := t.Cmds[i]
@@ -389,16 +400,9 @@ func (e *Executor) runDeferred(t *ast.Task, call *Call, i int, vars *ast.Vars, d
 	cmd.If = templater.ReplaceWithExtra(cmd.If, cache, extra)
 	cmd.Vars = templater.ReplaceVarsWithExtra(cmd.Vars, cache, extra)
 
-	tracer := otel.Tracer("github.com/go-task/task/v3")
-	ctx, span := tracer.Start(ctx, fmt.Sprintf("deferred[%d]", i), trace.WithAttributes(
-		attribute.String("command.index", fmt.Sprintf("%d", i)),
-		attribute.Bool("command.defer", true),
-	))
-	defer span.End()
-
+	// runCommand's span is the deferred command's (command.defer).
 	if err := e.runCommand(ctx, t, call, i); err != nil {
 		e.Logger.VerboseErrf(logger.Yellow, "task: ignored error in deferred cmd: %s\n", err.Error())
-		span.RecordError(err)
 	}
 }
 
@@ -471,7 +475,7 @@ func (e *Executor) runCommand(ctx context.Context, t *ast.Task, call *Call, i in
 		}
 		return err
 	case cmd.Cmd != "":
-		span.SetAttributes(attribute.String("command.type", "shell"), attribute.String("command.shell", cmd.Cmd))
+		span.SetAttributes(attribute.String("command.type", "shell"), attribute.String("command.shell", cmd.LogCmd)) // secrets masked, as logged
 
 		if !shouldRunOnCurrentPlatform(cmd.Platforms) {
 			e.Logger.VerboseOutf(logger.Yellow, "task: [%s] %s not for current platform - ignored\n", t.Name(), cmd.LogCmd)
@@ -567,6 +571,9 @@ func (e *Executor) startExecution(ctx context.Context, t *ast.Task, execute func
 	if other, ok := e.executionHashes[h]; ok {
 		e.executionHashesMutex.Unlock()
 		e.Logger.VerboseErrf(logger.Magenta, "task: skipping execution of task: %s\n", h)
+		// Not run again: the other execution's outcome is this one's (a
+		// failure still marks it failed, see RunTask).
+		trace.SpanFromContext(ctx).SetAttributes(attribute.String("task.outcome", "skipped"), attribute.String("task.skip_reason", "deduplicated"))
 
 		// Release our execution slot to avoid blocking other tasks while we wait
 		reacquire := e.releaseConcurrencyLimit()

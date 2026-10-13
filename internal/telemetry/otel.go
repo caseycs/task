@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"go.opentelemetry.io/contrib/exporters/autoexport"
 	"go.opentelemetry.io/otel"
@@ -16,6 +18,15 @@ import (
 )
 
 type TracerProviderShutdownFunc func(context.Context) error
+
+// FlushTimeout bounds how long sending the spans may delay Task's exit: a
+// collector that is down or slow costs every run at most this.
+const FlushTimeout = 2 * time.Second
+
+var (
+	providerMu sync.Mutex
+	provider   *trace.TracerProvider // set by Initialize when enabled
+)
 
 // DefaultServiceName is the spans' service when OTEL_SERVICE_NAME is unset.
 const DefaultServiceName = "task"
@@ -34,10 +45,20 @@ func Enabled() bool {
 	return os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") != "" || os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") != ""
 }
 
-func Initialize(ctx context.Context) (TracerProviderShutdownFunc, error) {
+// Initialize sets up tracing when Enabled: the global TracerProvider
+// exporting spans per the OTEL_* environment, and the W3C trace context
+// propagator. OpenTelemetry's own errors (e.g. a failed export) go to
+// onError, nil to drop them. The returned func flushes and shuts down,
+// taking at most FlushTimeout.
+func Initialize(ctx context.Context, onError func(error)) (TracerProviderShutdownFunc, error) {
 	if !Enabled() {
 		return func(context.Context) error { return nil }, nil
 	}
+	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
+		if onError != nil {
+			onError(err)
+		}
+	}))
 
 	spanExporter, err := autoexport.NewSpanExporter(ctx)
 	if err != nil {
@@ -55,17 +76,39 @@ func Initialize(ctx context.Context) (TracerProviderShutdownFunc, error) {
 	}
 
 	tracerProvider := trace.NewTracerProvider(
-		trace.WithBatcher(spanExporter),
+		trace.WithBatcher(spanExporter, trace.WithExportTimeout(FlushTimeout)),
 		trace.WithResource(res),
 	)
 	otel.SetTracerProvider(tracerProvider)
 	otel.SetTextMapPropagator(propagation.TraceContext{})
+	providerMu.Lock()
+	provider = tracerProvider
+	providerMu.Unlock()
 
-	return tracerProvider.Shutdown, nil
+	return func(ctx context.Context) error {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), FlushTimeout)
+		defer cancel()
+		return tracerProvider.Shutdown(ctx)
+	}, nil
+}
+
+// Flush sends the spans ended so far, taking at most FlushTimeout: for a
+// path that exits the process without returning (e.g. watch mode's
+// interrupt). Nothing when tracing isn't enabled.
+func Flush() {
+	providerMu.Lock()
+	p := provider
+	providerMu.Unlock()
+	if p == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), FlushTimeout)
+	defer cancel()
+	_ = p.ForceFlush(ctx)
 }
 
 // envCarrier is the W3C trace context in environment variables
-// (TRACEPARENT, TRACESTATE), as a TextMapCarrier.
+// (TRACEPARENT, TRACESTATE), as a TextMapCarrier; keys upper case.
 type envCarrier map[string]string
 
 func (c envCarrier) Get(key string) string { return c[strings.ToUpper(key)] }
@@ -106,7 +149,8 @@ func Environ(ctx context.Context, environ []string) []string {
 	propagation.TraceContext{}.Inject(ctx, carrier)
 	out := make([]string, 0, len(environ)+len(carrier))
 	for _, kv := range environ {
-		if key, _, _ := strings.Cut(kv, "="); key != "TRACEPARENT" && key != "TRACESTATE" {
+		// Any case: Windows' environment keys are case-insensitive.
+		if key, _, _ := strings.Cut(kv, "="); !strings.EqualFold(key, "TRACEPARENT") && !strings.EqualFold(key, "TRACESTATE") {
 			out = append(out, kv)
 		}
 	}
