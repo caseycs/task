@@ -16,7 +16,8 @@ func TestEnabled(t *testing.T) {
 		want bool
 	}{
 		"nothing set":            {nil, false},
-		"an exporter":            {map[string]string{"OTEL_TRACES_EXPORTER": "console"}, true},
+		"otlp":                   {map[string]string{"OTEL_TRACES_EXPORTER": "otlp"}, true},
+		"another exporter":       {map[string]string{"OTEL_TRACES_EXPORTER": "console", "OTEL_EXPORTER_OTLP_ENDPOINT": "http://x:4318"}, false},
 		"none":                   {map[string]string{"OTEL_TRACES_EXPORTER": "none", "OTEL_EXPORTER_OTLP_ENDPOINT": "http://x:4318"}, false},
 		"an endpoint":            {map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "http://x:4318"}, true},
 		"a traces endpoint only": {map[string]string{"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "http://x:4318/v1/traces"}, true},
