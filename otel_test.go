@@ -25,10 +25,10 @@ var (
 
 // otelRun runs the task name of testdata/otel under a root span of its own
 // (the trace a wrapper or CI job would pass in TRACEPARENT), and returns the
-// run's error, the root span's id and the spans of its trace by name.
+// root span's id, the spans of its trace by name and the run's error.
 // Spans are recorded by a global provider every test shares, told apart by
 // trace.
-func otelRun(t *testing.T, name string) (error, trace.SpanID, map[string]sdktrace.ReadOnlySpan) {
+func otelRun(t *testing.T, name string) (trace.SpanID, map[string]sdktrace.ReadOnlySpan, error) {
 	t.Helper()
 	otelOnce.Do(func() {
 		otelRecorder = tracetest.NewSpanRecorder()
@@ -46,7 +46,7 @@ func otelRun(t *testing.T, name string) (error, trace.SpanID, map[string]sdktrac
 			spans[s.Name()] = s
 		}
 	}
-	return err, root.SpanContext().SpanID(), spans
+	return root.SpanContext().SpanID(), spans, err
 }
 
 func otelAttr(s sdktrace.ReadOnlySpan, key string) attribute.Value {
@@ -60,7 +60,7 @@ func otelAttr(s sdktrace.ReadOnlySpan, key string) attribute.Value {
 
 func TestOtelTaskJoinsTheCallersTrace(t *testing.T) {
 	t.Parallel()
-	err, root, spans := otelRun(t, "ok")
+	root, spans, err := otelRun(t, "ok")
 	require.NoError(t, err)
 	require.Contains(t, spans, "ok")
 	assert.Equal(t, root, spans["ok"].Parent().SpanID(), "the task's span is a child of the caller's")
@@ -71,7 +71,7 @@ func TestOtelTaskJoinsTheCallersTrace(t *testing.T) {
 
 func TestOtelFailedTask(t *testing.T) {
 	t.Parallel()
-	err, _, spans := otelRun(t, "fail")
+	_, spans, err := otelRun(t, "fail")
 	require.Error(t, err)
 	s := spans["fail"]
 	require.NotNil(t, s)
@@ -83,7 +83,7 @@ func TestOtelFailedTask(t *testing.T) {
 // A dep's failure fails its parent, but the exit code stays the dep's.
 func TestOtelFailedDep(t *testing.T) {
 	t.Parallel()
-	err, _, spans := otelRun(t, "dep-fails")
+	_, spans, err := otelRun(t, "dep-fails")
 	require.Error(t, err)
 	assert.Equal(t, "failed", otelAttr(spans["dep-fails"], "task.outcome").AsString())
 	assert.False(t, otelAttr(spans["dep-fails"], "process.exit.code").Type() == attribute.INT64, "no exit code of its own")
@@ -92,7 +92,7 @@ func TestOtelFailedDep(t *testing.T) {
 
 func TestOtelTimeout(t *testing.T) {
 	t.Parallel()
-	err, _, spans := otelRun(t, "timeout")
+	_, spans, err := otelRun(t, "timeout")
 	require.Error(t, err)
 	assert.Equal(t, "failed", otelAttr(spans["timeout"], "task.outcome").AsString())
 	assert.Equal(t, int64(124), otelAttr(spans["timeout"], "process.exit.code").AsInt64())
@@ -100,7 +100,7 @@ func TestOtelTimeout(t *testing.T) {
 
 func TestOtelIgnoredError(t *testing.T) {
 	t.Parallel()
-	err, _, spans := otelRun(t, "ignored")
+	_, spans, err := otelRun(t, "ignored")
 	require.NoError(t, err)
 	assert.Equal(t, "executed", otelAttr(spans["ignored"], "task.outcome").AsString())
 	assert.Equal(t, "true", otelAttr(spans["shell[0]"], "command.error_ignored").AsString())
@@ -109,7 +109,7 @@ func TestOtelIgnoredError(t *testing.T) {
 // A deferred command's span is in the task's trace, under the task.
 func TestOtelDeferredInTheTasksTrace(t *testing.T) {
 	t.Parallel()
-	err, _, spans := otelRun(t, "deferred")
+	_, spans, err := otelRun(t, "deferred")
 	require.NoError(t, err)
 	var deferred sdktrace.ReadOnlySpan
 	for _, s := range spans {
@@ -124,7 +124,7 @@ func TestOtelDeferredInTheTasksTrace(t *testing.T) {
 // A run: once task called twice runs once; the second call's span says so.
 func TestOtelRunOnceDeduplicated(t *testing.T) {
 	t.Parallel()
-	err, _, _ := otelRun(t, "twice")
+	_, _, err := otelRun(t, "twice")
 	require.NoError(t, err)
 	var outcomes []string
 	for _, s := range otelRecorder.Ended() {
@@ -138,7 +138,7 @@ func TestOtelRunOnceDeduplicated(t *testing.T) {
 
 func TestOtelSecretsMasked(t *testing.T) {
 	t.Parallel()
-	err, _, spans := otelRun(t, "secret")
+	_, spans, err := otelRun(t, "secret")
 	require.NoError(t, err)
 	cmd := otelAttr(spans["shell[0]"], "command.shell").AsString()
 	assert.NotContains(t, cmd, "hunter2")
